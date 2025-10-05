@@ -1,0 +1,98 @@
+// so this is a temporary one that include only adxl345 reading for now
+
+#include <Wire.h>
+#include <Adafruit_ADXL345_U.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <math.h>
+
+#define SDA_PIN 8
+#define SCL_PIN 9
+
+#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+bool deviceConnected = false;
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    pServer->updateConnParams(pServer->getConnId(), 24, 48, 0, 600);
+    Serial.println("Client connected, requesting larger MTU...");
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    pServer->startAdvertising();
+    Serial.println("Client disconnected, advertising again...");
+  }
+};
+
+class MyCallbacks : public BLECharacteristicCallbacks {
+  void onRead(BLECharacteristic* pCharacteristic) {
+    Serial.println("Characteristic read request");
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  if (!accel.begin()) {
+    Serial.println("ADXL345 not detected! Check wiring.");
+    while (1);
+  }
+
+  accel.setRange(ADXL345_RANGE_16_G);
+  Serial.println("ADXL345 ready.");
+
+  BLEDevice::init("ESP32C3_JSON");
+  BLEDevice::setMTU(247);
+
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ |
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+  pCharacteristic->addDescriptor(new BLE2902());
+  pCharacteristic->setCallbacks(new MyCallbacks());
+
+  pService->start();
+  pServer->getAdvertising()->start();
+
+  Serial.println("BLE with ADXL345 started!");
+}
+
+void loop() {
+  if (deviceConnected) {
+    sensors_event_t event;
+    accel.getEvent(&event);
+
+    // Calculate resultant acceleration in G
+    float magnitude = sqrt(
+      event.acceleration.x * event.acceleration.x +
+      event.acceleration.y * event.acceleration.y +
+      event.acceleration.z * event.acceleration.z
+    ) / 9.81;
+
+    char jsonBuffer[64];
+    snprintf(jsonBuffer, sizeof(jsonBuffer),
+             "{\"gforce\":%.2f}", magnitude);
+
+    pCharacteristic->setValue((uint8_t*)jsonBuffer, strlen(jsonBuffer));
+    pCharacteristic->notify();
+
+    Serial.println(jsonBuffer);
+    delay(1000);
+  }
+}
