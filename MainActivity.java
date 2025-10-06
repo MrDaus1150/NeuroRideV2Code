@@ -1,5 +1,4 @@
 // this is for the android studio java code
-
 package com.example.testjson;
 
 import androidx.appcompat.app.AppCompatActivity;
@@ -107,10 +106,14 @@ public class MainActivity extends AppCompatActivity {
                 String value = new String(characteristic.getValue());
                 try {
                     JSONObject json = new JSONObject(value);
-                    double gforce = json.getDouble("gforce");
+                    double gforce = json.optDouble("gforce", -1);
+                    double temp = json.optDouble("temp", -999);
 
-                    String display = String.format(Locale.US, "G-Force: %.2f g", gforce);
+                    String display = String.format(Locale.US,
+                            "G-Force: %.2f g\nTemp: %.2f °C", gforce, temp);
+
                     runOnUiThread(() -> txtMessage.setText(display));
+
                 } catch (Exception e) {
                     runOnUiThread(() -> txtMessage.setText("Invalid JSON: " + value));
                 }
@@ -118,3 +121,4 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 }
+
