@@ -1,0 +1,128 @@
+#include <Wire.h>
+#include <Adafruit_ADXL345_U.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <math.h>
+
+#define SDA_PIN 8
+#define SCL_PIN 9
+#define THERMISTOR_PIN A0   // ADC pin for thermistor voltage divider
+
+#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+bool deviceConnected = false;
+
+// === Thermistor constants ===
+// Assuming 100k NTC with Beta ~3950, at 25°C -> 100kΩ
+const float SERIES_RESISTOR = 100000.0;  // 100k pull-up resistor
+const float NOMINAL_RESISTANCE = 100000.0;  // R25 = 100kΩ
+const float NOMINAL_TEMPERATURE = 25.0;     // T0 = 25°C
+const float BETA_COEFFICIENT = 3950.0;
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    pServer->updateConnParams(pServer->getConnId(), 24, 48, 0, 600);
+    Serial.println("Client connected, requesting larger MTU...");
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    pServer->startAdvertising();
+    Serial.println("Client disconnected, advertising again...");
+  }
+};
+
+class MyCallbacks : public BLECharacteristicCallbacks {
+  void onRead(BLECharacteristic* pCharacteristic) {
+    Serial.println("Characteristic read request");
+  }
+};
+
+// Function to read thermistor temperature
+float readThermistorCelsius() {
+  int adcValue = analogRead(THERMISTOR_PIN);
+  float voltage = (float)adcValue / 4095.0 * 3.3;  // ADC to voltage
+
+  // Fixed formula for bottom thermistor wiring (to GND)
+  float resistance = SERIES_RESISTOR * (voltage / (3.3 - voltage));
+
+  // Steinhart-Hart (simplified Beta equation)
+  float steinhart;
+  steinhart = resistance / NOMINAL_RESISTANCE;        // (R/Ro)
+  steinhart = log(steinhart);                         // ln(R/Ro)
+  steinhart /= BETA_COEFFICIENT;                      // 1/B * ln(R/Ro)
+  steinhart += 1.0 / (NOMINAL_TEMPERATURE + 273.15);  // + (1/To)
+  steinhart = 1.0 / steinhart;                        // Invert
+  steinhart -= 273.15;                                // Kelvin → °C
+
+  return steinhart;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  if (!accel.begin()) {
+    Serial.println("ADXL345 not detected! Check wiring.");
+    while (1);
+  }
+
+  accel.setRange(ADXL345_RANGE_16_G);
+  Serial.println("ADXL345 ready.");
+
+  BLEDevice::init("ESP32C3_JSON");
+  BLEDevice::setMTU(247);
+
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ |
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+  pCharacteristic->addDescriptor(new BLE2902());
+  pCharacteristic->setCallbacks(new MyCallbacks());
+
+  pService->start();
+  pServer->getAdvertising()->start();
+
+  Serial.println("BLE with ADXL345 + Thermistor started!");
+}
+
+void loop() {
+  if (deviceConnected) {
+    sensors_event_t event;
+    accel.getEvent(&event);
+
+    // Calculate resultant acceleration in G
+    float magnitude = sqrt(
+      event.acceleration.x * event.acceleration.x +
+      event.acceleration.y * event.acceleration.y +
+      event.acceleration.z * event.acceleration.z
+    ) / 9.81;
+
+    float temperature = readThermistorCelsius();
+
+    char jsonBuffer[128];
+    snprintf(jsonBuffer, sizeof(jsonBuffer),
+             "{\"gforce\":%.2f,\"temp\":%.2f}", magnitude, temperature);
+
+    pCharacteristic->setValue((uint8_t*)jsonBuffer, strlen(jsonBuffer));
+    pCharacteristic->notify();
+
+    Serial.println(jsonBuffer);
+    delay(1000);
+  }
+}
+
+
