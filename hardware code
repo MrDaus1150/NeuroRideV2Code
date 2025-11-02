@@ -1,0 +1,263 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_ADXL345_U.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <math.h>
+
+// ======== Pin Definitions ========
+#define SIM_RX 6
+#define SIM_TX 7
+#define SIM_PWR 10
+#define SDA_PIN 8
+#define SCL_PIN 9
+#define THERMISTOR_PIN 1
+#define BATTERY_PIN 3
+#define VREF 3.3
+
+// ======== BLE UUIDs ========
+#define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+// ======== Globals ========
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+bool deviceConnected = false;
+bool bleMode = false;
+HardwareSerial simSerial(1);
+
+// ======== Thermistor Constants ========
+const float SERIES_RESISTOR = 100000.0;
+const float NOMINAL_RESISTANCE = 100000.0;
+const float NOMINAL_TEMPERATURE = 25.0;
+const float BETA_COEFFICIENT = 3950.0;
+
+// ======== Battery Divider Constants ========
+const float R1 = 216000.0;
+const float R2 = 76000.0;
+
+// ======== n8n Webhook Info ========
+const char* APN = "my3g";
+const char* WEBHOOK_URL = "http://n8n.nrv2.xyz/webhook-test/MyEsp";
+
+// ======== BLE Callbacks ========
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    deviceConnected = true;
+    Serial.println("Client connected");
+  }
+  void onDisconnect(BLEServer* pServer) override {
+    deviceConnected = false;
+    pServer->startAdvertising();
+    Serial.println("Client disconnected, advertising again...");
+  }
+};
+
+// ======== Sensor Reading ========
+float readThermistorCelsius() {
+  int adcValue = analogRead(THERMISTOR_PIN);
+  float voltage = (float)adcValue / 4095.0 * VREF;
+  float resistance = SERIES_RESISTOR * (voltage / (VREF - voltage));
+  float steinhart = log(resistance / NOMINAL_RESISTANCE);
+  steinhart /= BETA_COEFFICIENT;
+  steinhart += 1.0 / (NOMINAL_TEMPERATURE + 273.15);
+  steinhart = 1.0 / steinhart;
+  steinhart -= 273.15;
+  return steinhart;
+}
+
+float readBatteryVoltage() {
+  int adcValue = analogRead(BATTERY_PIN);
+  float vout = (adcValue / 4095.0) * VREF;
+  float vin = vout * (R1 + R2) / R2;
+  return vin;
+}
+
+int voltageToPercent(float voltage) {
+  if (voltage >= 4.2) return 100;
+  if (voltage <= 3.3) return 0;
+  return (int)((voltage - 3.3) / (4.2 - 3.3) * 100.0);
+}
+
+// ======== BLE Setup ========
+void setupBLE() {
+  BLEDevice::init("ESP32C3_JSON");
+  BLEDevice::setPower(ESP_PWR_LVL_N12);
+  BLEDevice::setMTU(247);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+  pServer->getAdvertising()->start();
+  Serial.println("🔵 BLE advertising started (20s window)");
+}
+
+// ======== SIM AT Utils ========
+bool waitForResponse(String expect, uint32_t timeout = 5000) {
+  String resp = "";
+  uint32_t start = millis();
+  while (millis() - start < timeout) {
+    while (simSerial.available()) {
+      resp += simSerial.readString();
+      if (resp.indexOf(expect) != -1) {
+        Serial.println(resp);
+        return true;
+      }
+    }
+  }
+  Serial.println("⚠️ Timeout waiting for: " + expect);
+  return false;
+}
+
+void sendAT(String cmd, uint32_t delayMs = 500) {
+  simSerial.println(cmd);
+  Serial.println(">> " + cmd);
+  delay(delayMs);
+}
+
+// ======== SIM HTTP Post ========
+bool sendJSONtoN8N(String json) {
+  Serial.println("🌐 Sending data to n8n...");
+  sendAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"");
+  sendAT("AT+SAPBR=3,1,\"APN\",\"" + String(APN) + "\"");
+  sendAT("AT+SAPBR=1,1");
+  if (!waitForResponse("OK", 10000)) return false;
+
+  sendAT("AT+HTTPTERM"); // reset session
+  delay(300);
+  sendAT("AT+HTTPINIT");
+  sendAT("AT+HTTPPARA=\"CID\",1");
+  sendAT("AT+HTTPPARA=\"URL\",\"" + String(WEBHOOK_URL) + "\"");
+  sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
+
+  sendAT("AT+HTTPDATA=" + String(json.length()) + ",10000");
+  if (!waitForResponse("DOWNLOAD", 3000)) return false;
+  simSerial.print(json);
+  delay(1000);
+  sendAT("AT+HTTPACTION=1"); // POST
+  if (!waitForResponse("+HTTPACTION: 1,200", 15000)) {
+    Serial.println("❌ HTTP POST failed.");
+    sendAT("AT+HTTPTERM");
+    return false;
+  }
+
+  sendAT("AT+HTTPREAD");
+  waitForResponse("OK", 5000);
+  sendAT("AT+HTTPTERM");
+  Serial.println("✅ Data sent successfully to n8n.");
+  return true;
+}
+
+// ======== SIM Setup ========
+void setupSIM() {
+  Serial.println("📡 Switching to SIM mode...");
+  BLEDevice::deinit(true);
+  pinMode(SIM_PWR, OUTPUT);
+  digitalWrite(SIM_PWR, HIGH);
+  delay(3000);
+
+  simSerial.begin(115200, SERIAL_8N1, SIM_RX, SIM_TX);
+  delay(1000);
+
+  sendAT("AT");
+  waitForResponse("OK");
+  sendAT("ATE0");
+  sendAT("AT+CPIN?");
+  sendAT("AT+CSQ");
+  sendAT("AT+CREG?");
+  sendAT("AT+CGATT?");
+  sendAT("AT+CGDCONT=1,\"IP\",\"" + String(APN) + "\"");
+  Serial.println("✅ SIM setup completed.");
+}
+
+// ======== Setup ========
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  pinMode(SIM_PWR, OUTPUT);
+  digitalWrite(SIM_PWR, LOW);
+
+  if (!accel.begin()) Serial.println("⚠️ ADXL345 not detected!");
+  accel.setRange(ADXL345_RANGE_16_G);
+
+  setupBLE();
+  bleMode = true;
+
+  unsigned long start = millis();
+  while (millis() - start < 20000) {
+    if (deviceConnected) {
+      Serial.println("BLE client connected — staying in BLE mode.");
+      return;
+    }
+    delay(100);
+  }
+
+  bleMode = false;
+  setupSIM();
+}
+
+// ======== Loop ========
+unsigned long lastSend = 0;
+
+void loop() {
+  if (bleMode && deviceConnected) {
+    sensors_event_t event;
+    accel.getEvent(&event);
+    float magnitude = sqrt(
+      event.acceleration.x * event.acceleration.x +
+      event.acceleration.y * event.acceleration.y +
+      event.acceleration.z * event.acceleration.z
+    ) / 9.81;
+
+    float temperature = readThermistorCelsius();
+    float batteryVoltage = readBatteryVoltage();
+    int batteryPercent = voltageToPercent(batteryVoltage);
+
+    char jsonBuffer[160];
+    snprintf(jsonBuffer, sizeof(jsonBuffer),
+             "{\"gforce\":%.2f,\"temp\":%.2f,\"volt\":%.2f,\"batpct\":%d}",
+             magnitude, temperature, batteryVoltage, batteryPercent);
+
+    pCharacteristic->setValue((uint8_t*)jsonBuffer, strlen(jsonBuffer));
+    pCharacteristic->notify();
+    Serial.println(jsonBuffer);
+    delay(1000);
+
+  } else if (!bleMode) {
+    if (millis() - lastSend > 15000) {
+      sensors_event_t event;
+      accel.getEvent(&event);
+      float magnitude = sqrt(
+        event.acceleration.x * event.acceleration.x +
+        event.acceleration.y * event.acceleration.y +
+        event.acceleration.z * event.acceleration.z
+      ) / 9.81;
+
+      float temperature = readThermistorCelsius();
+      float batteryVoltage = readBatteryVoltage();
+      int batteryPercent = voltageToPercent(batteryVoltage);
+
+      char jsonBuffer[160];
+      snprintf(jsonBuffer, sizeof(jsonBuffer),
+               "{\"gforce\":%.2f,\"temp\":%.2f,\"volt\":%.2f,\"batpct\":%d}",
+               magnitude, temperature, batteryVoltage, batteryPercent);
+
+      Serial.println("JSON to send:");
+      Serial.println(jsonBuffer);
+      sendJSONtoN8N(jsonBuffer);
+
+      lastSend = millis();
+    }
+
+    if (simSerial.available()) Serial.write(simSerial.read());
+  }
+}
+
